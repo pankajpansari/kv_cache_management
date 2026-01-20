@@ -1,0 +1,40 @@
+================================================================================
+FlashInfer Microbenchmark: Llama 3.1 8B Decode Attention
+================================================================================
+Config: 32 Q heads, 8 KV heads, 128 head dim (GQA)
+GPU: NVIDIA A100-SXM4-80GB
+
+Benchmarking KV length = 512...
+Benchmarking KV length = 1024...
+Benchmarking KV length = 2048...
+Benchmarking KV length = 4096...
+
+================================================================================
+Results
+================================================================================
+  KV Len |    KV Size |  Attn (µs) |  Xfer (µs) |    Attn BW |    Xfer BW |  Xfer/Attn
+         |       (KB) |            |   (pinned) |     (GB/s) |     (GB/s) |      ratio
+--------------------------------------------------------------------------------
+     512 |     2048.0 |      16.46 |     189.11 |      127.4 |       11.1 |       11.5x
+    1024 |     4096.0 |      15.97 |     310.51 |      262.6 |       13.5 |       19.4x
+    2048 |     8192.0 |      16.09 |     558.52 |      521.4 |       15.0 |       34.7x
+    4096 |    16384.0 |      21.00 |    1028.46 |      798.8 |       16.3 |       49.0x
+
+================================================================================
+Analysis for Multi-Tier KV Cache
+================================================================================
+
+Pinned vs Pageable transfer:
+  KV= 512: pinned=189.1µs, pageable=201.2µs
+  KV=1024: pinned=310.5µs, pageable=333.9µs
+  KV=2048: pinned=558.5µs, pageable=602.8µs
+  KV=4096: pinned=1028.5µs, pageable=1139.0µs
+
+Key insight:
+  Transfer/Attention ratio > 1 means transfer CANNOT be hidden by decode attention
+  This is why chunked-prefill overlap (warm prefill) is necessary for tiered KV cache
+
+Reference bandwidths:
+  A100 HBM:     2,039 GB/s
+  PCIe 4.0 x16:    32 GB/s
+  PCIe 5.0 x16:    64 GB/s
