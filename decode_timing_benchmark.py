@@ -154,7 +154,7 @@ def run_benchmark(
     """Run decode timing benchmark."""
     
     print(f"Loading config: {model_name}")
-    config = AutoConfig.from_pretrained(model_name)
+    config = AutoConfig.from_pretrained(model_name, token = True)
     
     print(f"Architecture: hidden={config.hidden_size}, heads={config.num_attention_heads}, "
           f"kv_heads={config.num_key_value_heads}, intermediate={config.intermediate_size}")
