@@ -6,7 +6,6 @@ Linear layer timing with fresh weights per config to avoid L2 caching.
 import torch
 import torch.nn as nn
 import csv
-import matplotlib.pyplot as plt
 
 # Llama 3.1 8B config
 HIDDEN_SIZE = 4096
@@ -39,7 +38,7 @@ def forward_layer(layer, x):
     down = layer[6](gate * up)
     return down
 
-def benchmark_linear(num_tokens_list, num_layers=32, num_warmup=10, num_runs=50, dtype=torch.float16):
+def benchmark_linear(num_tokens_list, num_layers=32, num_warmup=5, num_runs=20, dtype=torch.float16):
     device = 'cuda'
     results = []
     
@@ -90,7 +89,7 @@ def main():
     print("-" * 50)
     
     # Token counts similar to figure (64 to 4096)
-    num_tokens_list = [32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024]
+    num_tokens_list = [32, 64, 128, 256, 512, 1024, 2048, 4096]
     
     results = benchmark_linear(num_tokens_list)
     
