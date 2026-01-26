@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 Decode timing benchmark for Llama 3.1 8B layer.
-Uses HuggingFace config for architecture + random weights (no 16GB download).
 Measures linear vs attention time breakdown across batch sizes.
-Replicating the decode panel of Sarathi-Serve Figure 4.
 """
 
 import torch
