@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Linear layer execution time vs number of tokens for Llama 3.1 8B on A100.
-Reproduces Sarathi-Serve Figure 6 style experiment (single GPU, no TP).
+Linear layer timing with fresh weights per config to avoid L2 caching.
 """
 
 import torch
 import torch.nn as nn
 import csv
+import matplotlib.pyplot as plt
 
 # Llama 3.1 8B config
 HIDDEN_SIZE = 4096
@@ -15,77 +15,59 @@ NUM_HEADS = 32
 NUM_KV_HEADS = 8
 HEAD_DIM = 128
 
-class LinearLayers(nn.Module):
-    """All linear layers in one Llama decoder layer."""
-    def __init__(self):
-        super().__init__()
-        # Attention projections
-        self.q_proj = nn.Linear(HIDDEN_SIZE, NUM_HEADS * HEAD_DIM, bias=False)
-        self.k_proj = nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False)
-        self.v_proj = nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False)
-        self.o_proj = nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
-        # MLP (SwiGLU)
-        self.gate_proj = nn.Linear(HIDDEN_SIZE, INTERMEDIATE_SIZE, bias=False)
-        self.up_proj = nn.Linear(HIDDEN_SIZE, INTERMEDIATE_SIZE, bias=False)
-        self.down_proj = nn.Linear(INTERMEDIATE_SIZE, HIDDEN_SIZE, bias=False)
-    
-    def forward(self, x):
-        # Attention linears
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        attn_out = self.o_proj(q)  # Using q as proxy for attn output shape
-        # MLP linears
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        down = self.down_proj(gate * up)
-        return down
-
-def benchmark_linear(num_tokens_list, num_layers=32, num_warmup=10, num_runs=100, dtype=torch.float16):
-    """Benchmark linear layer time for full model (all layers)."""
-
-    device = 'cuda'
-    layer = LinearLayers().to(device=device, dtype=dtype)
+def create_layer(device, dtype):
+    """Create fresh layer with new random weights."""
+    layer = nn.ModuleList([
+        nn.Linear(HIDDEN_SIZE, NUM_HEADS * HEAD_DIM, bias=False),      # q
+        nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False),   # k
+        nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False),   # v
+        nn.Linear(NUM_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False),      # o
+        nn.Linear(HIDDEN_SIZE, INTERMEDIATE_SIZE, bias=False),         # gate
+        nn.Linear(HIDDEN_SIZE, INTERMEDIATE_SIZE, bias=False),         # up
+        nn.Linear(INTERMEDIATE_SIZE, HIDDEN_SIZE, bias=False),         # down
+    ]).to(device=device, dtype=dtype)
     layer.eval()
-    
-    # === GLOBAL WARMUP: cycle through ALL configs first ===
-    print("Global warmup pass...")
-    with torch.no_grad():
-        for _ in range(3):  # 3 full passes
-            for num_tokens in num_tokens_list:
-                x = torch.randn(num_tokens, HIDDEN_SIZE, device=device, dtype=dtype)
-                for _ in range(5):
-                    _ = layer(x)
-    torch.cuda.synchronize()
-    print("Global warmup done.\n")
-    
+    return layer
+
+def forward_layer(layer, x):
+    q = layer[0](x)
+    k = layer[1](x)
+    v = layer[2](x)
+    o = layer[3](q)
+    gate = layer[4](x)
+    up = layer[5](x)
+    down = layer[6](gate * up)
+    return down
+
+def benchmark_linear(num_tokens_list, num_layers=32, num_warmup=10, num_runs=50, dtype=torch.float16):
+    device = 'cuda'
     results = []
     
     for num_tokens in num_tokens_list:
-        x = torch.randn(num_tokens, HIDDEN_SIZE, device=device, dtype=dtype)
-        
-        # Per-config warmup (generous)
-        with torch.no_grad():
-            for _ in range(num_warmup):
-                _ = layer(x)
-        torch.cuda.synchronize()
-        
-        # Benchmark with fresh events each run
         times = []
-        with torch.no_grad():
-            for _ in range(num_runs):
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                
-                start.record()
-                _ = layer(x)
-                end.record()
-                
-                torch.cuda.synchronize()
-                times.append(start.elapsed_time(end))
         
-        # Remove outliers (first few might still be unstable)
-        times = sorted(times)[5:-5]  # trim 5 from each end
+        for run in range(num_warmup + num_runs):
+            # Fresh layer each run - no L2 cache reuse
+            layer = create_layer(device, dtype)
+            x = torch.randn(num_tokens, HIDDEN_SIZE, device=device, dtype=dtype)
+            
+            torch.cuda.synchronize()
+            
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            
+            with torch.no_grad():
+                start.record()
+                _ = forward_layer(layer, x)
+                end.record()
+            
+            torch.cuda.synchronize()
+            
+            if run >= num_warmup:  # skip warmup runs
+                times.append(start.elapsed_time(end))
+            
+            del layer  # free memory
+            torch.cuda.empty_cache()
         
         layer_time_ms = sum(times) / len(times)
         std_ms = torch.tensor(times).std().item()
@@ -108,7 +90,7 @@ def main():
     print("-" * 50)
     
     # Token counts similar to figure (64 to 4096)
-    num_tokens_list = [64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096]
+    num_tokens_list = [32, 64, 96, 128, 160, 192, 224, 256, 320, 384, 512, 640, 768, 1024]
     
     results = benchmark_linear(num_tokens_list)
     
