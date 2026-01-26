@@ -3,11 +3,13 @@ import pandas as pd
 
 results = pd.read_csv('linear_layer_timing.csv', header = 0)
 # Plot
-tokens = results['num_tokens'][:7]
-times = results['total_ms'][:7]
+tokens = results['num_tokens']
+times = results['total_ms']
 
 plt.figure(figsize=(8, 5))
-plt.plot(tokens, times, 'b-o', linewidth=2, markersize=6, label='TP-1 (no parallelism)')
+plt.plot(tokens, times, 'b-o', linewidth=2, markersize=6)
+plt.xscale('log', base=2)
+plt.xticks(tokens, tokens)
 plt.xlabel('Number of tokens')
 plt.ylabel('Time (ms)')
 plt.title('Linear Layer Execution Time - Llama 3.1 8B on A100')
