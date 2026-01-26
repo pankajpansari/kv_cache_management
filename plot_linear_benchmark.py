@@ -1,10 +1,10 @@
 import matplotlib.pyplot as plt
 import pandas as pd
 
-results = pd.read_csv('linear_layer_timing.csv')
+results = pd.read_csv('linear_layer_timing.csv', header = 0)
 # Plot
-tokens = [r['num_tokens'] for r in results]
-times = [r['total_ms'] for r in results]
+tokens = results['num_tokens'][:7]
+times = results['total_ms'][:7]
 
 plt.figure(figsize=(8, 5))
 plt.plot(tokens, times, 'b-o', linewidth=2, markersize=6, label='TP-1 (no parallelism)')

@@ -43,46 +43,61 @@ class LinearLayers(nn.Module):
 
 def benchmark_linear(num_tokens_list, num_layers=32, num_warmup=10, num_runs=100, dtype=torch.float16):
     """Benchmark linear layer time for full model (all layers)."""
+
     device = 'cuda'
-    
-    # Create one layer, we'll multiply time by num_layers
     layer = LinearLayers().to(device=device, dtype=dtype)
     layer.eval()
+    
+    # === GLOBAL WARMUP: cycle through ALL configs first ===
+    print("Global warmup pass...")
+    with torch.no_grad():
+        for _ in range(3):  # 3 full passes
+            for num_tokens in num_tokens_list:
+                x = torch.randn(num_tokens, HIDDEN_SIZE, device=device, dtype=dtype)
+                for _ in range(5):
+                    _ = layer(x)
+    torch.cuda.synchronize()
+    print("Global warmup done.\n")
     
     results = []
     
     for num_tokens in num_tokens_list:
         x = torch.randn(num_tokens, HIDDEN_SIZE, device=device, dtype=dtype)
         
-        # Warmup
+        # Per-config warmup (generous)
         with torch.no_grad():
             for _ in range(num_warmup):
                 _ = layer(x)
-        
         torch.cuda.synchronize()
         
-        # Benchmark
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        
+        # Benchmark with fresh events each run
         times = []
         with torch.no_grad():
             for _ in range(num_runs):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                
                 start.record()
                 _ = layer(x)
                 end.record()
+                
                 torch.cuda.synchronize()
                 times.append(start.elapsed_time(end))
         
+        # Remove outliers (first few might still be unstable)
+        times = sorted(times)[5:-5]  # trim 5 from each end
+        
         layer_time_ms = sum(times) / len(times)
-        total_time_ms = layer_time_ms * num_layers  # Scale to full model
+        std_ms = torch.tensor(times).std().item()
+        total_time_ms = layer_time_ms * num_layers
         
         results.append({
             'num_tokens': num_tokens,
             'per_layer_ms': layer_time_ms,
+            'std_ms': std_ms,
             'total_ms': total_time_ms,
         })
-        print(f"tokens={num_tokens:>4}: per_layer={layer_time_ms:.3f}ms, total={total_time_ms:.2f}ms")
+        print(f"tokens={num_tokens:>4}: {total_time_ms:.2f}ms (±{std_ms*num_layers:.2f}ms)")
     
     return results
 
@@ -104,5 +119,6 @@ def main():
         writer.writerows(results)
     print("\nSaved to linear_layer_timing.csv")
     
+
 if __name__ == '__main__':
     main()
