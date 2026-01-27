@@ -5,12 +5,13 @@ Measures linear vs attention time breakdown across batch sizes.
 Handles OOM gracefully for large context lengths.
 """
 
+import argparse
+import csv
+import gc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import csv
-import argparse
-import gc
 from transformers import AutoConfig
 
 
@@ -183,7 +184,8 @@ def run_single_config(
     Returns results dict with timing data or OOM marker.
     """
     head_dim = config.hidden_size // config.num_attention_heads
-    
+    num_layers = config.num_hidden_layers
+
     result = {
         'batch_size': batch_size,
         'seq_len': seq_len,
@@ -197,18 +199,18 @@ def run_single_config(
             device=device, dtype=dtype
         )
         k_cache = torch.randn(
-            batch_size, config.num_key_value_heads, seq_len, head_dim,
+            num_layers, batch_size, config.num_key_value_heads, seq_len, head_dim,
             device=device, dtype=dtype
         )
         v_cache = torch.randn(
-            batch_size, config.num_key_value_heads, seq_len, head_dim,
+            num_layers, batch_size, config.num_key_value_heads, seq_len, head_dim,
             device=device, dtype=dtype
         )
         
         # Warmup
         with torch.no_grad():
             for _ in range(num_warmup):
-                _ = layer.forward_timed(hidden_states, k_cache, v_cache)
+                _ = layer.forward_timed(hidden_states, k_cache[0], v_cache[0])
         
         # Benchmark
         all_timings = {k: [] for k in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']}
