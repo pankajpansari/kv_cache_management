@@ -2,6 +2,7 @@
 """
 Decode timing benchmark for Llama 3.1 8B layer.
 Measures linear vs attention time breakdown across batch sizes.
+Handles OOM gracefully for large context lengths.
 """
 
 import torch
@@ -9,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import csv
 import argparse
+import gc
 from transformers import AutoConfig
 
 
@@ -140,6 +142,127 @@ class LlamaDecoderLayer(nn.Module):
         }
 
 
+def clear_gpu_memory():
+    """Aggressively clear GPU memory after OOM."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def estimate_memory_gb(batch_size: int, seq_len: int, config, dtype: torch.dtype) -> float:
+    """Estimate memory required for KV cache in GB."""
+    bytes_per_element = 2 if dtype in [torch.float16, torch.bfloat16] else 4
+    head_dim = config.hidden_size // config.num_attention_heads
+    
+    # KV cache: 2 * batch * kv_heads * seq_len * head_dim
+    kv_cache_bytes = 2 * batch_size * config.num_key_value_heads * seq_len * head_dim * bytes_per_element
+    
+    # Attention weights during computation: batch * num_heads * 1 * seq_len (for Q @ K^T)
+    # After GQA expansion: batch * num_heads * seq_len * head_dim for expanded K, V
+    expanded_kv_bytes = 2 * batch_size * config.num_attention_heads * seq_len * head_dim * bytes_per_element
+    
+    # Attention scores: batch * num_heads * 1 * seq_len
+    attn_scores_bytes = batch_size * config.num_attention_heads * seq_len * bytes_per_element
+    
+    total_bytes = kv_cache_bytes + expanded_kv_bytes + attn_scores_bytes
+    return total_bytes / (1024 ** 3)
+
+
+def run_single_config(
+    layer: nn.Module,
+    config,
+    batch_size: int,
+    seq_len: int,
+    num_warmup: int,
+    num_runs: int,
+    dtype: torch.dtype,
+    device: str
+) -> dict:
+    """
+    Run benchmark for a single configuration.
+    Returns results dict with timing data or OOM marker.
+    """
+    head_dim = config.hidden_size // config.num_attention_heads
+    
+    result = {
+        'batch_size': batch_size,
+        'seq_len': seq_len,
+        'status': 'OK',
+    }
+    
+    try:
+        # Create inputs
+        hidden_states = torch.randn(
+            batch_size, 1, config.hidden_size,
+            device=device, dtype=dtype
+        )
+        k_cache = torch.randn(
+            batch_size, config.num_key_value_heads, seq_len, head_dim,
+            device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            batch_size, config.num_key_value_heads, seq_len, head_dim,
+            device=device, dtype=dtype
+        )
+        
+        # Warmup
+        with torch.no_grad():
+            for _ in range(num_warmup):
+                _ = layer.forward_timed(hidden_states, k_cache, v_cache)
+        
+        # Benchmark
+        all_timings = {k: [] for k in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']}
+        
+        with torch.no_grad():
+            for _ in range(num_runs):
+                timings = layer.forward_timed(hidden_states, k_cache, v_cache)
+                for k, v in timings.items():
+                    all_timings[k].append(v)
+        
+        # Compute statistics
+        for k, v in all_timings.items():
+            result[f'{k}_mean'] = sum(v) / len(v)
+            result[f'{k}_std'] = torch.tensor(v).std().item()
+        
+        # Aggregates
+        result['linear_total_ms'] = result['attn_linear_ms_mean'] + result['mlp_linear_ms_mean']
+        result['total_ms'] = (result['attn_linear_ms_mean'] + result['attention_ms_mean'] +
+                              result['mlp_linear_ms_mean'] + result['other_ms_mean'])
+        result['linear_pct'] = 100 * result['linear_total_ms'] / result['total_ms']
+        result['attention_pct'] = 100 * result['attention_ms_mean'] / result['total_ms']
+        result['other_pct'] = 100 * result['other_ms_mean'] / result['total_ms']
+        
+        # Clean up tensors explicitly
+        del hidden_states, k_cache, v_cache
+        clear_gpu_memory()
+        
+    except torch.cuda.OutOfMemoryError as e:
+        # Handle OOM gracefully
+        result['status'] = 'OOM'
+        
+        # Fill timing fields with NaN to maintain CSV structure
+        for suffix in ['_mean', '_std']:
+            for key in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']:
+                result[f'{key}{suffix}'] = float('nan')
+        
+        result['linear_total_ms'] = float('nan')
+        result['total_ms'] = float('nan')
+        result['linear_pct'] = float('nan')
+        result['attention_pct'] = float('nan')
+        result['other_pct'] = float('nan')
+        
+        # Estimate what memory would have been needed
+        result['estimated_mem_gb'] = estimate_memory_gb(batch_size, seq_len, config, dtype)
+        
+        # Clear GPU memory for subsequent runs
+        clear_gpu_memory()
+        
+        print(f"  OOM at batch_size={batch_size}, seq_len={seq_len} "
+              f"(estimated ~{result['estimated_mem_gb']:.1f} GB needed)")
+    
+    return result
+
+
 def run_benchmark(
     model_name: str,
     batch_sizes: list,
@@ -149,91 +272,97 @@ def run_benchmark(
     dtype: torch.dtype = torch.float16,
     device: str = 'cuda'
 ) -> list:
-    """Run decode timing benchmark."""
+    """Run decode timing benchmark with OOM handling."""
     
     print(f"Loading config: {model_name}")
-    config = AutoConfig.from_pretrained(model_name, token = True)
+    config = AutoConfig.from_pretrained(model_name, token=True)
     
     print(f"Architecture: hidden={config.hidden_size}, heads={config.num_attention_heads}, "
           f"kv_heads={config.num_key_value_heads}, intermediate={config.intermediate_size}")
+    
+    # Report GPU memory
+    gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    print(f"GPU Memory: {gpu_mem_total:.1f} GB total")
     
     # Create layer with random weights
     layer = LlamaDecoderLayer(config).to(device=device, dtype=dtype)
     layer.eval()
     
-    head_dim = config.hidden_size // config.num_attention_heads
-    
     results = []
+    oom_configs = []
     
-    for seq_len in seq_lengths:
+    # Sort seq_lengths ascending so we can potentially skip larger ones after OOM
+    seq_lengths_sorted = sorted(seq_lengths)
+    
+    for seq_len in seq_lengths_sorted:
+        # Track if this seq_len OOMed for all batch sizes
+        seq_len_all_oom = True
+        
         for batch_size in batch_sizes:
             print(f"Running: batch_size={batch_size}, seq_len={seq_len}")
             
-            # Create inputs
-            hidden_states = torch.randn(
-                batch_size, 1, config.hidden_size,
-                device=device, dtype=dtype
+            # Estimate memory before attempting
+            est_mem = estimate_memory_gb(batch_size, seq_len, config, dtype)
+            print(f"  Estimated memory: ~{est_mem:.1f} GB")
+            
+            result = run_single_config(
+                layer=layer,
+                config=config,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_warmup=num_warmup,
+                num_runs=num_runs,
+                dtype=dtype,
+                device=device
             )
-            k_cache = torch.randn(
-                batch_size, config.num_key_value_heads, seq_len, head_dim,
-                device=device, dtype=dtype
-            )
-            v_cache = torch.randn(
-                batch_size, config.num_key_value_heads, seq_len, head_dim,
-                device=device, dtype=dtype
-            )
-            
-            # Warmup
-            with torch.no_grad():
-                for _ in range(num_warmup):
-                    _ = layer.forward_timed(hidden_states, k_cache, v_cache)
-            
-            # Benchmark
-            all_timings = {k: [] for k in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']}
-            
-            with torch.no_grad():
-                for _ in range(num_runs):
-                    timings = layer.forward_timed(hidden_states, k_cache, v_cache)
-                    for k, v in timings.items():
-                        all_timings[k].append(v)
-            
-            # Compute statistics
-            result = {
-                'batch_size': batch_size,
-                'seq_len': seq_len,
-            }
-            
-            for k, v in all_timings.items():
-                result[f'{k}_mean'] = sum(v) / len(v)
-                result[f'{k}_std'] = torch.tensor(v).std().item()
-            
-            # Aggregates
-            result['linear_total_ms'] = result['attn_linear_ms_mean'] + result['mlp_linear_ms_mean']
-            result['total_ms'] = (result['attn_linear_ms_mean'] + result['attention_ms_mean'] +
-                                  result['mlp_linear_ms_mean'] + result['other_ms_mean'])
-            result['linear_pct'] = 100 * result['linear_total_ms'] / result['total_ms']
-            result['attention_pct'] = 100 * result['attention_ms_mean'] / result['total_ms']
-            result['other_pct'] = 100 * result['other_ms_mean'] / result['total_ms']
             
             results.append(result)
             
-            print(f"  Total: {result['total_ms']:.3f}ms | "
-                  f"Linear: {result['linear_pct']:.1f}% | "
-                  f"Attention: {result['attention_pct']:.1f}% | "
-                  f"Other: {result['other_pct']:.1f}%")
+            if result['status'] == 'OK':
+                seq_len_all_oom = False
+                print(f"  Total: {result['total_ms']:.3f}ms | "
+                      f"Linear: {result['linear_pct']:.1f}% | "
+                      f"Attention: {result['attention_pct']:.1f}% | "
+                      f"Other: {result['other_pct']:.1f}%")
+            else:
+                oom_configs.append((batch_size, seq_len))
+    
+    # Summary of OOM cases
+    if oom_configs:
+        print(f"\n⚠️  OOM occurred for {len(oom_configs)} configurations:")
+        for bs, sl in oom_configs:
+            print(f"    batch_size={bs}, seq_len={sl}")
     
     return results
 
 
 def save_results(results: list, filename: str):
-    """Save results to CSV."""
+    """Save results to CSV, including OOM markers."""
     if not results:
         return
     
-    fieldnames = list(results[0].keys())
+    # Ensure consistent fieldnames across all results
+    all_fields = set()
+    for r in results:
+        all_fields.update(r.keys())
+    
+    # Define preferred order
+    ordered_fields = [
+        'batch_size', 'seq_len', 'status',
+        'total_ms', 'linear_total_ms', 'linear_pct', 'attention_pct', 'other_pct',
+        'attn_linear_ms_mean', 'attn_linear_ms_std',
+        'attention_ms_mean', 'attention_ms_std',
+        'mlp_linear_ms_mean', 'mlp_linear_ms_std',
+        'other_ms_mean', 'other_ms_std',
+        'estimated_mem_gb'
+    ]
+    
+    # Add any fields that might be missing from ordered list
+    fieldnames = [f for f in ordered_fields if f in all_fields]
+    fieldnames.extend([f for f in sorted(all_fields) if f not in fieldnames])
     
     with open(filename, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(results)
     
@@ -248,7 +377,7 @@ def main():
                         default=[1, 2, 4, 8, 16, 32, 64],
                         help='Batch sizes to test')
     parser.add_argument('--seq-lengths', type=int, nargs='+',
-                        default=[512, 1024, 2048],
+                        default=[512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
                         help='KV cache sequence lengths to test')
     parser.add_argument('--warmup', type=int, default=10,
                         help='Number of warmup iterations')
@@ -287,14 +416,24 @@ def main():
     save_results(results, args.output)
     
     # Summary
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("SUMMARY")
-    print("=" * 80)
-    print(f"{'Batch':<8} {'Seq':<8} {'Total(ms)':<12} {'Linear%':<10} {'Attn%':<10} {'Other%':<10}")
-    print("-" * 80)
+    print("=" * 100)
+    print(f"{'Batch':<8} {'Seq':<10} {'Status':<8} {'Total(ms)':<12} {'Linear%':<10} {'Attn%':<10} {'Other%':<10}")
+    print("-" * 100)
     for r in results:
-        print(f"{r['batch_size']:<8} {r['seq_len']:<8} {r['total_ms']:<12.3f} "
-              f"{r['linear_pct']:<10.1f} {r['attention_pct']:<10.1f} {r['other_pct']:<10.1f}")
+        if r['status'] == 'OK':
+            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['status']:<8} {r['total_ms']:<12.3f} "
+                  f"{r['linear_pct']:<10.1f} {r['attention_pct']:<10.1f} {r['other_pct']:<10.1f}")
+        else:
+            est_mem = r.get('estimated_mem_gb', 0)
+            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['status']:<8} {'N/A':<12} "
+                  f"{'N/A':<10} {'N/A':<10} (est. {est_mem:.1f} GB)")
+    
+    # Print statistics
+    ok_count = sum(1 for r in results if r['status'] == 'OK')
+    oom_count = sum(1 for r in results if r['status'] == 'OOM')
+    print(f"\nTotal: {len(results)} configs | OK: {ok_count} | OOM: {oom_count}")
 
 
 if __name__ == '__main__':
