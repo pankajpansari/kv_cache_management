@@ -86,7 +86,8 @@ def analyze_csv(csv_path: str, bandwidth_gbps: float, output_path: str = None) -
         DataFrame with analysis results
     """
     df = pd.read_csv(csv_path)
-    
+    df = df[df['status'] == 'OK'] 
+
     # Validate required columns
     required_cols = ['batch_size', 'seq_len', 'total_ms']
     missing = [c for c in required_cols if c not in df.columns]

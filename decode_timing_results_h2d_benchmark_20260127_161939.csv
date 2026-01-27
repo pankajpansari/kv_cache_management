@@ -1,0 +1,2 @@
+gpu_name,bandwidth_gbps,avg_time_ms,min_time_ms,max_time_ms,std_time_ms,transfer_size_gb,iterations,timestamp
+NVIDIA A100-SXM4-80GB,13.045050379629854,76.65742721557618,72.68195343017578,105.212158203125,9.526778934870192,1.0,10,20260127_161939
