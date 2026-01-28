@@ -61,11 +61,11 @@ def plot_percentage_breakdown(df: pd.DataFrame, seq_len: int, output_file: str =
     plt.show()
 
 
-def plot_multi_seqlen(df: pd.DataFrame, output_file: str = None):
+def plot_multi_seqlen(df: pd.DataFrame, i: int, output_file: str = None):
     """
     Create subplots for different sequence lengths, marking OOM results with a red cross.
     """
-    seq_lengths = sorted(df['seq_len'].unique())[4:8]
+    seq_lengths = sorted(df['seq_len'].unique())[4*i:4*(i+1)]
     n_plots = len(seq_lengths)
     
     fig, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 5), sharey=False)
@@ -144,7 +144,8 @@ def main():
         lines = [line.rstrip().rstrip(',') for line in f]
     df = pd.read_csv(args.csv_file)
     
-    plot_multi_seqlen(df, args.output)
+    plot_multi_seqlen(df, 0, 'results/decode_timing_results1.png')
+    plot_multi_seqlen(df, 1, 'results/decode_timing_results2.png')
     print_summary(df)
 
 if __name__ == '__main__':
