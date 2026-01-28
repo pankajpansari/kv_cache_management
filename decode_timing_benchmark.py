@@ -1,18 +1,39 @@
 #!/usr/bin/env python3
 """
-Decode timing benchmark for Llama 3.1 8B layer.
+Decode timing benchmark for Llama 3.1 8B layer using FlashInfer.
 Measures linear vs attention time breakdown across batch sizes.
-Handles OOM gracefully for large context lengths.
+FlashInfer is preferred for decode because:
+  - Dedicated decode kernels optimized for single-query attention
+  - Native GQA support without expand/repeat_interleave overhead
+  - Designed for serving with paged KV cache
 """
 
 import argparse
 import csv
 import gc
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig
+
+# FlashInfer imports
+try:
+    import flashinfer
+    from flashinfer import BatchDecodeWithPagedKVCache
+    FLASHINFER_AVAILABLE = True
+except ImportError:
+    FLASHINFER_AVAILABLE = False
+    print("Warning: FlashInfer not available, falling back to manual attention")
+
+# FlashAttention fallback
+try:
+    from flash_attn import flash_attn_with_kvcache
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
 
 
 class RMSNorm(nn.Module):
@@ -28,10 +49,128 @@ class RMSNorm(nn.Module):
         return self.weight * x
 
 
-class LlamaDecoderLayer(nn.Module):
-    """Single Llama decoder layer with random weights."""
+@dataclass
+class AttentionConfig:
+    """Configuration for attention computation."""
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
     
-    def __init__(self, config):
+    @property
+    def num_kv_groups(self) -> int:
+        return self.num_heads // self.num_kv_heads
+
+
+class FlashInferDecodeAttention(nn.Module):
+    """
+    FlashInfer-based decode attention.
+    Uses paged KV cache format for efficient memory access.
+    """
+    def __init__(self, config: AttentionConfig, max_batch_size: int = 64, page_size: int = 16):
+        super().__init__()
+        self.config = config
+        self.page_size = page_size
+        self.max_batch_size = max_batch_size
+        
+        # Workspace buffer for FlashInfer (reused across calls)
+        self.workspace_buffer = None
+        self.decode_wrapper = None
+        
+    def _init_workspace(self, device: torch.device):
+        """Initialize FlashInfer workspace buffer."""
+        if self.workspace_buffer is None:
+            # Workspace size recommendation from FlashInfer docs
+            self.workspace_buffer = torch.empty(
+                128 * 1024 * 1024,  # 128MB workspace
+                dtype=torch.uint8,
+                device=device
+            )
+    
+    def forward(
+        self,
+        q: torch.Tensor,  # [batch, 1, num_heads, head_dim]
+        k_cache: torch.Tensor,  # [batch, seq_len, num_kv_heads, head_dim] or paged
+        v_cache: torch.Tensor,  # [batch, seq_len, num_kv_heads, head_dim] or paged
+        seq_lens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Decode attention using FlashInfer.
+        
+        For simplicity, this uses the non-paged ragged tensor API.
+        For production, use BatchDecodeWithPagedKVCache with proper page tables.
+        """
+        batch_size = q.shape[0]
+        seq_len = k_cache.shape[1]
+        device = q.device
+        
+        self._init_workspace(device)
+        
+        # Reshape for FlashInfer: expects [total_tokens, num_heads, head_dim]
+        # For decode, total_tokens = batch_size (one token per sequence)
+        q_flat = q.squeeze(1)  # [batch, num_heads, head_dim]
+        
+        # Create sequence length tensor if not provided
+        if seq_lens is None:
+            seq_lens = torch.full((batch_size,), seq_len, dtype=torch.int32, device=device)
+        
+        # FlashInfer ragged decode attention
+        # KV cache format: [batch, seq_len, num_kv_heads, head_dim]
+        # Need to convert to ragged format: [total_kv_tokens, num_kv_heads, head_dim]
+        kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        
+        # Flatten KV cache to ragged format
+        k_flat = k_cache.reshape(-1, self.config.num_kv_heads, self.config.head_dim)
+        v_flat = v_cache.reshape(-1, self.config.num_kv_heads, self.config.head_dim)
+        
+        # Use FlashInfer's batch decode
+        output = flashinfer.batch_decode_with_padded_kv_cache(
+            q_flat,
+            k_cache,  # [batch, seq_len, num_kv_heads, head_dim]
+            v_cache,
+            kv_layout="NHD",  # [batch, seq_len, num_heads, head_dim]
+        )
+        
+        return output.unsqueeze(1)  # [batch, 1, num_heads, head_dim]
+
+
+class ManualDecodeAttention(nn.Module):
+    """Manual attention implementation as fallback."""
+    def __init__(self, config: AttentionConfig):
+        super().__init__()
+        self.config = config
+        
+    def forward(
+        self,
+        q: torch.Tensor,  # [batch, 1, num_heads, head_dim]
+        k_cache: torch.Tensor,  # [batch, seq_len, num_kv_heads, head_dim]
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = q.shape[0]
+        
+        # Transpose for attention: [batch, heads, seq, dim]
+        q = q.transpose(1, 2)  # [batch, num_heads, 1, head_dim]
+        k = k_cache.transpose(1, 2)  # [batch, num_kv_heads, seq_len, head_dim]
+        v = v_cache.transpose(1, 2)
+        
+        # Expand KV for GQA
+        k = k.repeat_interleave(self.config.num_kv_groups, dim=1)
+        v = v.repeat_interleave(self.config.num_kv_groups, dim=1)
+        
+        # Attention computation
+        scale = 1.0 / (self.config.head_dim ** 0.5)
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        output = torch.matmul(attn_weights, v)
+        
+        # [batch, num_heads, 1, head_dim] -> [batch, 1, num_heads, head_dim]
+        return output.transpose(1, 2)
+
+
+class LlamaDecoderLayer(nn.Module):
+    """Single Llama decoder layer with configurable attention backend."""
+    
+    def __init__(self, config, use_flashinfer: bool = True):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -54,18 +193,30 @@ class LlamaDecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         
-        # GQA groups
-        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        # Attention backend
+        attn_config = AttentionConfig(
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim
+        )
+        
+        self.use_flashinfer = use_flashinfer and FLASHINFER_AVAILABLE
+        if self.use_flashinfer:
+            self.attention = FlashInferDecodeAttention(attn_config)
+        else:
+            self.attention = ManualDecodeAttention(attn_config)
     
     def forward_timed(
         self,
         hidden_states: torch.Tensor,
-        k_cache: torch.Tensor,
+        k_cache: torch.Tensor,  # [batch, seq_len, num_kv_heads, head_dim]
         v_cache: torch.Tensor,
     ) -> dict:
         """
         Decode forward with component timing.
-        Skips RoPE (negligible element-wise ops for timing purposes).
+        
+        KV cache format: [batch, seq_len, num_kv_heads, head_dim]
+        This is the NHD layout preferred by FlashInfer.
         """
         batch_size = hidden_states.shape[0]
         
@@ -82,33 +233,25 @@ class LlamaDecoderLayer(nn.Module):
         # === Q, K, V Projections ===
         events['qkv'][0].record()
         q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        k_new = self.k_proj(hidden_states)
+        v_new = self.v_proj(hidden_states)
         events['qkv'][1].record()
         
-        # Reshape for attention
-        q = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, 1, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Reshape Q for attention: [batch, 1, num_heads, head_dim]
+        q = q.view(batch_size, 1, self.num_heads, self.head_dim)
         
-        # Concat with cache (skip RoPE - negligible for timing)
-        k = torch.cat([k_cache, k], dim=2)
-        v = torch.cat([v_cache, v], dim=2)
-        
-        # Expand KV for GQA
-        k = k.repeat_interleave(self.num_kv_groups, dim=1)
-        v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        # New K, V would be appended to cache in real inference
+        # For benchmarking, we just use the existing cache
+        # k_new = k_new.view(batch_size, 1, self.num_kv_heads, self.head_dim)
+        # v_new = v_new.view(batch_size, 1, self.num_kv_heads, self.head_dim)
         
         # === Attention Computation ===
         events['attn'][0].record()
-        scale = 1.0 / (self.head_dim ** 0.5)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_output = torch.matmul(attn_weights, v)
+        attn_output = self.attention(q, k_cache, v_cache)
         events['attn'][1].record()
         
-        # Reshape
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, -1)
+        # Reshape: [batch, 1, num_heads, head_dim] -> [batch, 1, hidden_size]
+        attn_output = attn_output.reshape(batch_size, 1, -1)
         
         # === O Projection ===
         events['o_proj'][0].record()
@@ -144,7 +287,7 @@ class LlamaDecoderLayer(nn.Module):
 
 
 def clear_gpu_memory():
-    """Aggressively clear GPU memory after OOM."""
+    """Aggressively clear GPU memory."""
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -155,18 +298,19 @@ def estimate_memory_gb(batch_size: int, seq_len: int, config, dtype: torch.dtype
     bytes_per_element = 2 if dtype in [torch.float16, torch.bfloat16] else 4
     head_dim = config.hidden_size // config.num_attention_heads
     
-    # KV cache: 2 * batch * kv_heads * seq_len * head_dim
+    # KV cache: 2 * batch * kv_heads * seq_len * head_dim (NHD format)
     kv_cache_bytes = 2 * batch_size * config.num_key_value_heads * seq_len * head_dim * bytes_per_element
     
-    # Attention weights during computation: batch * num_heads * 1 * seq_len (for Q @ K^T)
-    # After GQA expansion: batch * num_heads * seq_len * head_dim for expanded K, V
-    expanded_kv_bytes = 2 * batch_size * config.num_attention_heads * seq_len * head_dim * bytes_per_element
+    # For FlashInfer, no GQA expansion needed - much more memory efficient!
+    # Only workspace buffer (~128MB) + small intermediate tensors
     
-    # Attention scores: batch * num_heads * 1 * seq_len
-    attn_scores_bytes = batch_size * config.num_attention_heads * seq_len * bytes_per_element
+    # For manual attention, need expanded KV + attention scores
+    if not FLASHINFER_AVAILABLE:
+        expanded_kv_bytes = 2 * batch_size * config.num_attention_heads * seq_len * head_dim * bytes_per_element
+        attn_scores_bytes = batch_size * config.num_attention_heads * seq_len * bytes_per_element
+        kv_cache_bytes += expanded_kv_bytes + attn_scores_bytes
     
-    total_bytes = kv_cache_bytes + expanded_kv_bytes + attn_scores_bytes
-    return total_bytes / (1024 ** 3)
+    return kv_cache_bytes / (1024 ** 3)
 
 
 def run_single_config(
@@ -179,17 +323,14 @@ def run_single_config(
     dtype: torch.dtype,
     device: str
 ) -> dict:
-    """
-    Run benchmark for a single configuration.
-    Returns results dict with timing data or OOM marker.
-    """
+    """Run benchmark for a single configuration."""
     head_dim = config.hidden_size // config.num_attention_heads
-    num_layers = config.num_hidden_layers
 
     result = {
         'batch_size': batch_size,
         'seq_len': seq_len,
         'status': 'OK',
+        'backend': 'flashinfer' if layer.use_flashinfer else 'manual',
     }
     
     try:
@@ -198,19 +339,22 @@ def run_single_config(
             batch_size, 1, config.hidden_size,
             device=device, dtype=dtype
         )
+        
+        # KV cache in NHD format: [batch, seq_len, num_kv_heads, head_dim]
+        # This is the native format for FlashInfer
         k_cache = torch.randn(
-            num_layers, batch_size, config.num_key_value_heads, seq_len, head_dim,
+            batch_size, seq_len, config.num_key_value_heads, head_dim,
             device=device, dtype=dtype
         )
         v_cache = torch.randn(
-            num_layers, batch_size, config.num_key_value_heads, seq_len, head_dim,
+            batch_size, seq_len, config.num_key_value_heads, head_dim,
             device=device, dtype=dtype
         )
         
         # Warmup
         with torch.no_grad():
             for _ in range(num_warmup):
-                _ = layer.forward_timed(hidden_states, k_cache[0], v_cache[0])
+                _ = layer.forward_timed(hidden_states, k_cache, v_cache)
         
         # Benchmark
         all_timings = {k: [] for k in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']}
@@ -234,15 +378,11 @@ def run_single_config(
         result['attention_pct'] = 100 * result['attention_ms_mean'] / result['total_ms']
         result['other_pct'] = 100 * result['other_ms_mean'] / result['total_ms']
         
-        # Clean up tensors explicitly
         del hidden_states, k_cache, v_cache
         clear_gpu_memory()
         
-    except torch.cuda.OutOfMemoryError as e:
-        # Handle OOM gracefully
+    except torch.cuda.OutOfMemoryError:
         result['status'] = 'OOM'
-        
-        # Fill timing fields with NaN to maintain CSV structure
         for suffix in ['_mean', '_std']:
             for key in ['attn_linear_ms', 'attention_ms', 'mlp_linear_ms', 'other_ms']:
                 result[f'{key}{suffix}'] = float('nan')
@@ -252,13 +392,9 @@ def run_single_config(
         result['linear_pct'] = float('nan')
         result['attention_pct'] = float('nan')
         result['other_pct'] = float('nan')
-        
-        # Estimate what memory would have been needed
         result['estimated_mem_gb'] = estimate_memory_gb(batch_size, seq_len, config, dtype)
         
-        # Clear GPU memory for subsequent runs
         clear_gpu_memory()
-        
         print(f"  OOM at batch_size={batch_size}, seq_len={seq_len} "
               f"(estimated ~{result['estimated_mem_gb']:.1f} GB needed)")
     
@@ -272,9 +408,10 @@ def run_benchmark(
     num_warmup: int = 10,
     num_runs: int = 50,
     dtype: torch.dtype = torch.float16,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    use_flashinfer: bool = True
 ) -> list:
-    """Run decode timing benchmark with OOM handling."""
+    """Run decode timing benchmark."""
     
     print(f"Loading config: {model_name}")
     config = AutoConfig.from_pretrained(model_name, token=True)
@@ -282,28 +419,25 @@ def run_benchmark(
     print(f"Architecture: hidden={config.hidden_size}, heads={config.num_attention_heads}, "
           f"kv_heads={config.num_key_value_heads}, intermediate={config.intermediate_size}")
     
-    # Report GPU memory
     gpu_mem_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"GPU Memory: {gpu_mem_total:.1f} GB total")
     
-    # Create layer with random weights
-    layer = LlamaDecoderLayer(config).to(device=device, dtype=dtype)
+    # Create layer
+    layer = LlamaDecoderLayer(config, use_flashinfer=use_flashinfer).to(device=device, dtype=dtype)
     layer.eval()
+    
+    backend = "FlashInfer" if layer.use_flashinfer else "Manual"
+    print(f"Attention backend: {backend}")
     
     results = []
     oom_configs = []
     
-    # Sort seq_lengths ascending so we can potentially skip larger ones after OOM
     seq_lengths_sorted = sorted(seq_lengths)
     
     for seq_len in seq_lengths_sorted:
-        # Track if this seq_len OOMed for all batch sizes
-        seq_len_all_oom = True
-        
         for batch_size in batch_sizes:
             print(f"Running: batch_size={batch_size}, seq_len={seq_len}")
             
-            # Estimate memory before attempting
             est_mem = estimate_memory_gb(batch_size, seq_len, config, dtype)
             print(f"  Estimated memory: ~{est_mem:.1f} GB")
             
@@ -321,7 +455,6 @@ def run_benchmark(
             results.append(result)
             
             if result['status'] == 'OK':
-                seq_len_all_oom = False
                 print(f"  Total: {result['total_ms']:.3f}ms | "
                       f"Linear: {result['linear_pct']:.1f}% | "
                       f"Attention: {result['attention_pct']:.1f}% | "
@@ -329,7 +462,6 @@ def run_benchmark(
             else:
                 oom_configs.append((batch_size, seq_len))
     
-    # Summary of OOM cases
     if oom_configs:
         print(f"\n⚠️  OOM occurred for {len(oom_configs)} configurations:")
         for bs, sl in oom_configs:
@@ -339,18 +471,16 @@ def run_benchmark(
 
 
 def save_results(results: list, filename: str):
-    """Save results to CSV, including OOM markers."""
+    """Save results to CSV."""
     if not results:
         return
     
-    # Ensure consistent fieldnames across all results
     all_fields = set()
     for r in results:
         all_fields.update(r.keys())
     
-    # Define preferred order
     ordered_fields = [
-        'batch_size', 'seq_len', 'status',
+        'batch_size', 'seq_len', 'status', 'backend',
         'total_ms', 'linear_total_ms', 'linear_pct', 'attention_pct', 'other_pct',
         'attn_linear_ms_mean', 'attn_linear_ms_std',
         'attention_ms_mean', 'attention_ms_std',
@@ -359,7 +489,6 @@ def save_results(results: list, filename: str):
         'estimated_mem_gb'
     ]
     
-    # Add any fields that might be missing from ordered list
     fieldnames = [f for f in ordered_fields if f in all_fields]
     fieldnames.extend([f for f in sorted(all_fields) if f not in fieldnames])
     
@@ -372,7 +501,7 @@ def save_results(results: list, filename: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Decode timing benchmark for Llama 3.1 8B')
+    parser = argparse.ArgumentParser(description='Decode timing benchmark with FlashInfer')
     parser.add_argument('--model', type=str, default='meta-llama/Llama-3.1-8B',
                         help='HuggingFace model name (for config only)')
     parser.add_argument('--batch-sizes', type=int, nargs='+',
@@ -385,10 +514,12 @@ def main():
                         help='Number of warmup iterations')
     parser.add_argument('--runs', type=int, default=50,
                         help='Number of measurement iterations')
-    parser.add_argument('--output', type=str, default='decode_timing_results.csv',
+    parser.add_argument('--output', type=str, default='decode_timing_flashinfer.csv',
                         help='Output CSV filename')
     parser.add_argument('--dtype', type=str, default='fp16', choices=['fp16', 'bf16'],
                         help='Data type')
+    parser.add_argument('--no-flashinfer', action='store_true',
+                        help='Disable FlashInfer (use manual attention)')
     
     args = parser.parse_args()
     
@@ -400,6 +531,8 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
+    print(f"FlashInfer available: {FLASHINFER_AVAILABLE}")
+    print(f"FlashAttention available: {FLASH_ATTN_AVAILABLE}")
     print(f"Config from: {args.model}")
     print(f"Dtype: {args.dtype}")
     print(f"Batch sizes: {args.batch_sizes}")
@@ -412,27 +545,27 @@ def main():
         seq_lengths=args.seq_lengths,
         num_warmup=args.warmup,
         num_runs=args.runs,
-        dtype=dtype
+        dtype=dtype,
+        use_flashinfer=not args.no_flashinfer
     )
     
     save_results(results, args.output)
     
     # Summary
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 110)
     print("SUMMARY")
-    print("=" * 100)
-    print(f"{'Batch':<8} {'Seq':<10} {'Status':<8} {'Total(ms)':<12} {'Linear%':<10} {'Attn%':<10} {'Other%':<10}")
-    print("-" * 100)
+    print("=" * 110)
+    print(f"{'Batch':<8} {'Seq':<10} {'Backend':<12} {'Status':<8} {'Total(ms)':<12} {'Linear%':<10} {'Attn%':<10} {'Other%':<10}")
+    print("-" * 110)
     for r in results:
         if r['status'] == 'OK':
-            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['status']:<8} {r['total_ms']:<12.3f} "
+            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['backend']:<12} {r['status']:<8} {r['total_ms']:<12.3f} "
                   f"{r['linear_pct']:<10.1f} {r['attention_pct']:<10.1f} {r['other_pct']:<10.1f}")
         else:
             est_mem = r.get('estimated_mem_gb', 0)
-            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['status']:<8} {'N/A':<12} "
+            print(f"{r['batch_size']:<8} {r['seq_len']:<10} {r['backend']:<12} {r['status']:<8} {'N/A':<12} "
                   f"{'N/A':<10} {'N/A':<10} (est. {est_mem:.1f} GB)")
     
-    # Print statistics
     ok_count = sum(1 for r in results if r['status'] == 'OK')
     oom_count = sum(1 for r in results if r['status'] == 'OOM')
     print(f"\nTotal: {len(results)} configs | OK: {ok_count} | OOM: {oom_count}")
