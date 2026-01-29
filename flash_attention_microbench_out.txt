@@ -1,0 +1,54 @@
+================================================================================
+FlashAttention Microbenchmark: Llama 3.1 8B Decode Attention
+================================================================================
+Config: 32 Q heads, 8 KV heads, 128 head dim (GQA)
+GPU: NVIDIA A100-SXM4-80GB
+
+Benchmarking KV length = 512...
+Benchmarking KV length = 1024...
+Benchmarking KV length = 2048...
+Benchmarking KV length = 4096...
+
+================================================================================
+Results (batch_size=1)
+================================================================================
+  KV Len |    KV Size |  Attn (µs) |  Xfer (µs) |    Attn BW |    Xfer BW |  Xfer/Attn
+         |       (KB) |            |   (pinned) |     (GB/s) |     (GB/s) |      ratio
+--------------------------------------------------------------------------------
+     512 |     2048.0 |      25.21 |     131.89 |       83.2 |       15.9 |        5.2x
+    1024 |     4096.0 |      21.81 |     219.52 |      192.3 |       19.1 |       10.1x
+    2048 |     8192.0 |      24.84 |     365.27 |      337.7 |       23.0 |       14.7x
+    4096 |    16384.0 |      30.15 |     675.27 |      556.5 |       24.8 |       22.4x
+
+================================================================================
+Batched Decode (showing how attention time scales)
+================================================================================
+
+KV Length = 2048
+   Batch |    Attn (µs) |   µs/request |   Throughput
+--------------------------------------------------
+       1 |        25.03 |        25.03 |        39953 req/s
+       4 |        33.73 |         8.43 |       118594 req/s
+       8 |        56.96 |         7.12 |       140454 req/s
+      16 |        97.59 |         6.10 |       163948 req/s
+      32 |       233.11 |         7.28 |       137272 req/s
+
+================================================================================
+Analysis for Multi-Tier KV Cache
+================================================================================
+
+Pinned vs Pageable transfer:
+  KV= 512: pinned=131.9µs, pageable=226.9µs, speedup=1.72x
+  KV=1024: pinned=219.5µs, pageable=335.3µs, speedup=1.53x
+  KV=2048: pinned=365.3µs, pageable=519.8µs, speedup=1.42x
+  KV=4096: pinned=675.3µs, pageable=945.0µs, speedup=1.40x
+
+Key insight:
+  Transfer/Attention ratio > 1 means transfer CANNOT be hidden by decode attention alone
+  This validates the need for chunked-prefill overlap (warm prefill) for tiered KV cache
+
+Reference bandwidths:
+  A100 HBM:     2,039 GB/s
+  PCIe 4.0 x16:    32 GB/s
+  PCIe 5.0 x16:    64 GB/s
+  NVLink (A100):  600 GB/s
